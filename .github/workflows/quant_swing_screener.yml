@@ -1,0 +1,39 @@
+name: Quant Swing Trade Screener
+
+on:
+  schedule:
+    # 10:00 AM IST is 04:30 AM UTC every Saturday (Cron format: Minute Hour Day Month DayOfWeek)
+    - cron: '30 4 * * 6'
+  workflow_dispatch: # Allows manual trigger anytime from GitHub UI
+
+jobs:
+  run-screener:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: 'pip'
+
+      - name: Install Dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install pandas numpy yfinance requests
+
+      - name: Execute Swing Screener Engine
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+        run: |
+          python scripts/quant_screener.py
+
+      - name: Archive Results Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: quant-screener-results
+          path: output/quant_screener_results.csv
