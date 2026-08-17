@@ -30,7 +30,7 @@ jobs:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
         run: |
-          python/quant_screener.py
+          python scripts/quant_screener.py
 
       - name: Archive Results Artifact
         uses: actions/upload-artifact@v4
