@@ -1,13 +1,20 @@
 import os
 import io
+import json
+from datetime import datetime
 import requests
 import pandas as pd
 import numpy as np
 import yfinance as yf
 from concurrent.futures import ThreadPoolExecutor, as_completed
+import gspread
+from gspread_formatting import (
+    CellFormat, Color, TextFormat, format_cell_ranges,
+    ConditionalFormatRule, BooleanRule, BooleanCondition, get_conditional_format_rules
+)
 
 def get_nifty_500_tickers():
-    """Fetches current Nifty 500 constituents directly from official repository."""
+    """Fetches current Nifty 500 constituents directly from official NSE repository."""
     url = "https://archives.nseindia.com/content/indices/ind_nifty500list.csv"
     headers = {
         'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
@@ -23,7 +30,6 @@ def get_nifty_500_tickers():
     except Exception as e:
         print(f"Failed to fetch live Nifty 500 list ({e}). Falling back to baseline universe.")
     
-    # Static fallback universe in case network request to NSE fails
     return [
         "POLYCAB.NS", "DIXON.NS", "TITAN.NS", "TRENT.NS", 
         "DEEPAKNTR.NS", "PIIND.NS", "BAJFINANCE.NS", "KEI.NS", "HONASA.NS"
@@ -34,12 +40,10 @@ def extract_latest_two_years(series_or_df):
     if series_or_df is None or series_or_df.empty:
         return None, None
     
-    # Sort columns/index chronologically ascending
     cleaned = series_or_df.dropna()
     if len(cleaned) < 2:
         return None, None
     
-    # Sort by date index/columns if available
     try:
         sorted_series = cleaned.sort_index(ascending=False)
         curr_val = float(sorted_series.iloc[0])
@@ -49,7 +53,7 @@ def extract_latest_two_years(series_or_df):
         return None, None
 
 def evaluate_quant_model_v2(symbol):
-    """Evaluates individual ticker against V2 100-Point Audit Engine & Multibagger Hard Gates."""
+    """Evaluates individual ticker against V2 100-Point Audit Engine & Hard Gates."""
     audit = {
         "Ticker": symbol.replace(".NS", ""),
         "Fundamental_Status": "INSUFFICIENT_DATA",
@@ -70,7 +74,7 @@ def evaluate_quant_model_v2(symbol):
     try:
         ticker = yf.Ticker(symbol)
         
-        # Fetch 1 year daily OHLCV
+        # 1. Price/Volume History
         hist = ticker.history(period="1y")
         if hist.empty or len(hist) < 200:
             audit["Error_Reason"] = "Insufficient daily price/volume history (<200 bars)"
@@ -79,13 +83,13 @@ def evaluate_quant_model_v2(symbol):
         latest_bar = hist.iloc[-1]
         audit["Close_Price"] = round(float(latest_bar['Close']), 2)
 
-        # Fetch Financial Statements
+        # 2. Financial Statements
         financials = ticker.financials
         balance_sheet = ticker.balance_sheet
         cashflow = ticker.cashflow
 
         if financials is None or financials.empty or balance_sheet is None or balance_sheet.empty:
-            audit["Error_Reason"] = "Missing primary financial statements from data source"
+            audit["Error_Reason"] = "Missing primary financial statements"
             return audit
 
         fund_score = 0.0
@@ -93,7 +97,7 @@ def evaluate_quant_model_v2(symbol):
         total_metrics_attempted = 4
 
         # =========================================================
-        # PILLAR 1: REVENUE GROWTH (25 Points) + HARD GATE FLOOR
+        # PILLAR 1: REVENUE GROWTH (25 Pts) + HARD GATE FLOOR
         # =========================================================
         if 'Total Revenue' in financials.index:
             rev_curr, rev_prev = extract_latest_two_years(financials.loc['Total Revenue'])
@@ -108,14 +112,13 @@ def evaluate_quant_model_v2(symbol):
                     audit["Action"] = "REJECT"
                     return audit
 
-                # Scoring
                 if rev_growth >= 0.15:
                     fund_score += 25.0
                 elif rev_growth >= 0.08:
                     fund_score += 12.5
 
         # =========================================================
-        # PILLAR 2: EBITDA MARGIN EXPANSION (25 Points)
+        # PILLAR 2: EBITDA MARGIN EXPANSION (25 Pts)
         # =========================================================
         if 'EBITDA' in financials.index and 'Total Revenue' in financials.index:
             ebitda_curr, ebitda_prev = extract_latest_two_years(financials.loc['EBITDA'])
@@ -128,14 +131,13 @@ def evaluate_quant_model_v2(symbol):
                 audit["EBITDA_Margin_Delta_Pct"] = round(margin_delta * 100, 2)
                 metrics_computed += 1
 
-                # Scoring
-                if margin_delta >= 0.01: # >= 1.00 percentage point expansion
+                if margin_delta >= 0.01:
                     fund_score += 25.0
                 elif margin_delta > 0:
                     fund_score += 12.5
 
         # =========================================================
-        # PILLAR 3: BALANCE SHEET HEALTH (20 Points) + DEBT TRAP GATE
+        # PILLAR 3: BALANCE SHEET HEALTH (20 Pts) + DEBT TRAP GATE
         # =========================================================
         ebitda_curr, ebitda_prev = extract_latest_two_years(financials.loc['EBITDA']) if 'EBITDA' in financials.index else (None, None)
         debt_curr, debt_prev = extract_latest_two_years(balance_sheet.loc['Total Debt']) if 'Total Debt' in balance_sheet.index else (None, None)
@@ -147,33 +149,31 @@ def evaluate_quant_model_v2(symbol):
 
             # 🛑 HARD GATE 2: Prolonged Debt Trap Filter
             if debt_ebitda_curr > 2.5:
-                # Check YoY De-leveraging Trajectory if previous year data exists
                 if debt_prev is not None and ebitda_prev is not None and ebitda_prev > 0:
                     debt_ebitda_prev = debt_prev / ebitda_prev
                     deleveraging_delta = debt_ebitda_prev - debt_ebitda_curr
                     
-                    if deleveraging_delta < 0.5: # Must de-leverage by >0.5x YoY to remain eligible
+                    if deleveraging_delta < 0.5:
                         audit["Error_Reason"] = f"Failed Hard Gate: High Prolonged Debt (Debt/EBITDA: {debt_ebitda_curr}x)"
                         audit["Action"] = "REJECT"
                         return audit
                 else:
-                    audit["Error_Reason"] = f"Failed Hard Gate: High Debt (Debt/EBITDA: {debt_ebitda_curr}x) without trajectory proof"
+                    audit["Error_Reason"] = f"Failed Hard Gate: High Debt ({debt_ebitda_curr}x) without trajectory proof"
                     audit["Action"] = "REJECT"
                     return audit
 
-            # Scoring
             if debt_ebitda_curr < 1.5:
                 fund_score += 20.0
             elif 1.5 <= debt_ebitda_curr <= 2.5:
                 fund_score += 10.0
 
         # =========================================================
-        # PILLAR 4: STRUCTURAL QUALITY ENGINE (15 Points Max)
+        # PILLAR 4: STRUCTURAL QUALITY ENGINE (15 Pts Max)
         # =========================================================
         p4_score = 0.0
         p4_metrics_found = 0
 
-        # Sub-component A: Profitability Quality / Capital Efficiency (ROCE / ROE Estimate - 5 Pts)
+        # Sub-component A: ROCE (5 Pts)
         ebit_curr, _ = extract_latest_two_years(financials.loc['EBIT']) if 'EBIT' in financials.index else (None, None)
         eq_curr, _ = extract_latest_two_years(balance_sheet.loc['Stockholders Equity']) if 'Stockholders Equity' in balance_sheet.index else (None, None)
         
@@ -183,10 +183,10 @@ def evaluate_quant_model_v2(symbol):
                 roce = ebit_curr / capital_employed
                 audit["ROCE_Pct"] = round(roce * 100, 2)
                 p4_metrics_found += 1
-                if roce >= 0.15: # 15% ROCE Threshold
+                if roce >= 0.15:
                     p4_score += 5.0
 
-        # Sub-component B: Cash Flow Quality (Free Cash Flow > 0 - 5 Pts)
+        # Sub-component B: Cash Flow Quality (5 Pts)
         if cashflow is not None and not cashflow.empty:
             ocf_curr, _ = extract_latest_two_years(cashflow.loc['Operating Cash Flow']) if 'Operating Cash Flow' in cashflow.index else (None, None)
             capex_curr, _ = extract_latest_two_years(cashflow.loc['Capital Expenditure']) if 'Capital Expenditure' in cashflow.index else (0, 0)
@@ -199,7 +199,7 @@ def evaluate_quant_model_v2(symbol):
                     audit["FCF_Positive"] = True
                     p4_score += 5.0
 
-        # Sub-component C: Earnings Consistency (Positive Operating Income across periods - 5 Pts)
+        # Sub-component C: Earnings Consistency (5 Pts)
         if 'Operating Income' in financials.index or 'Net Income' in financials.index:
             inc_key = 'Operating Income' if 'Operating Income' in financials.index else 'Net Income'
             inc_curr, inc_prev = extract_latest_two_years(financials.loc[inc_key])
@@ -213,7 +213,7 @@ def evaluate_quant_model_v2(symbol):
             metrics_computed += 1
 
         # =========================================================
-        # FUNDAMENTAL STATUS AUDIT & DATA QUALITY
+        # AUDIT & DATA QUALITY ASSESSMENT
         # =========================================================
         audit["Fund_Score"] = fund_score
 
@@ -230,7 +230,7 @@ def evaluate_quant_model_v2(symbol):
             return audit
 
         # =========================================================
-        # TECHNICAL TRIGGER ENGINE (15 Points Max)
+        # TECHNICAL TRIGGER ENGINE (15 Pts Max)
         # =========================================================
         tech_score = 0.0
         hist['EMA_50'] = hist['Close'].ewm(span=50, adjust=False).mean()
@@ -239,11 +239,11 @@ def evaluate_quant_model_v2(symbol):
 
         latest = hist.iloc[-1]
 
-        # Trend Alignment (7.5 Pts): Price > EMA200 AND EMA50 > EMA200
+        # Trend Alignment (7.5 Pts)
         if (latest['Close'] > latest['EMA_200']) and (latest['EMA_50'] > latest['EMA_200']):
             tech_score += 7.5
 
-        # Breakout Expansion (7.5 Pts): Close >= 95% of 52-Wk High AND Volume > 1.2x 20MA
+        # Breakout Expansion (7.5 Pts)
         high_52wk = hist['Close'].max()
         if (latest['Close'] >= 0.95 * high_52wk) and (latest['Volume'] > 1.2 * latest['Vol_20MA']):
             tech_score += 7.5
@@ -251,9 +251,7 @@ def evaluate_quant_model_v2(symbol):
         audit["Tech_Score"] = tech_score
         audit["Total_Score"] = fund_score + tech_score
 
-        # =========================================================
-        # FINAL ACTION CLASSIFICATION
-        # =========================================================
+        # Action Classification
         if audit["Fundamental_Status"] == "VALID" and fund_score >= 60.0:
             if tech_score >= 7.5 and audit["Total_Score"] >= 75.0:
                 audit["Action"] = "FULL BUY SIGNAL"
@@ -266,7 +264,7 @@ def evaluate_quant_model_v2(symbol):
 
     except Exception as e:
         audit["Fundamental_Status"] = "CALCULATION_ERROR"
-        audit["Error_Reason"] = f"Unhandled Execution Exception: {str(e)}"
+        audit["Error_Reason"] = f"Unhandled Exception: {str(e)}"
         return audit
 
 def send_telegram_alert(df):
@@ -280,9 +278,13 @@ def send_telegram_alert(df):
 
     buys = df[df['Action'] == "FULL BUY SIGNAL"].sort_values(by="Total_Score", ascending=False)
     watchlist = df[df['Action'] == "WATCHLIST (Base Building)"].sort_values(by="Fund_Score", ascending=False)
+    valid_count = len(df[df['Fundamental_Status'] == 'VALID'])
 
-    msg = f"📊 *NIFTY 500 QUANT SCREENER V2 AUDIT*\n"
-    msg += f"Valid Audit Candidates: {len(df[df['Fundamental_Status'] == 'VALID'])}\n\n"
+    msg = f"📊 *NIFTY 500 QUANT SCREENER V2*\n"
+    msg += f"• Parsed Universe: {len(df)} stocks\n"
+    msg += f"• Clean Audit Data: {valid_count}\n"
+    msg += f"• Actionable BUY Signals: {len(buys)}\n"
+    msg += f"• Watchlist Candidates: {len(watchlist)}\n\n"
     
     msg += "🚀 *FULL BUY SIGNALS (Score ≥ 75):*\n"
     if not buys.empty:
@@ -306,13 +308,86 @@ def send_telegram_alert(df):
     except Exception as e:
         print(f"Failed to post Telegram alert: {e}")
 
+def sync_to_google_sheets(df):
+    """Syncs results to Google Sheets with monthly tab overwrite and cell highlighting."""
+    creds_json = os.environ.get("GOOGLE_CREDENTIALS_JSON")
+    spreadsheet_id = os.environ.get("SPREADSHEET_ID")
+
+    if not creds_json or not spreadsheet_id:
+        print("Google Sheets API credentials not configured. Skipping Sheets sync.")
+        return
+
+    try:
+        creds_dict = json.loads(creds_json)
+        gc = gspread.service_account_from_dict(creds_dict)
+        sh = gc.open_by_key(spreadsheet_id)
+
+        month_tab_name = datetime.now().strftime("%Y-%m")
+
+        # Overwrite Check: Clear worksheet if exists, else add new worksheet
+        try:
+            worksheet = sh.worksheet(month_tab_name)
+            worksheet.clear()
+            print(f"Overwriting existing worksheet tab: [{month_tab_name}]")
+        except gspread.WorksheetNotFound:
+            worksheet = sh.add_worksheet(title=month_tab_name, rows=str(len(df) + 50), cols="20")
+            print(f"Created new worksheet tab: [{month_tab_name}]")
+
+        upload_df = df.copy().fillna("")
+        
+        # Upload Data
+        worksheet.update([upload_df.columns.values.tolist()] + upload_df.values.tolist())
+
+        # =========================================================
+        # STYLING AND HIGHLIGHTS
+        # =========================================================
+        # Header Row Formatting
+        header_format = CellFormat(
+            backgroundColor=Color(0.2, 0.2, 0.2),
+            textFormat=TextFormat(bold=True, color=Color(1, 1, 1))
+        )
+        format_cell_ranges(worksheet, [('1:1', header_format)])
+
+        # Conditional Formatting
+        rules = get_conditional_format_rules(worksheet)
+        
+        buy_rule = ConditionalFormatRule(
+            ranges=[gspread.utils.a1_range_to_grid_range(f"A2:Z{len(df)+1}")],
+            booleanRule=BooleanRule(
+                condition=BooleanCondition('TEXT_EQ', ['FULL BUY SIGNAL']),
+                format=CellFormat(
+                    backgroundColor=Color(0.85, 0.95, 0.85),
+                    textFormat=TextFormat(bold=True, color=Color(0.0, 0.5, 0.0))
+                )
+            )
+        )
+
+        watchlist_rule = ConditionalFormatRule(
+            ranges=[gspread.utils.a1_range_to_grid_range(f"A2:Z{len(df)+1}")],
+            booleanRule=BooleanRule(
+                condition=BooleanCondition('TEXT_EQ', ['WATCHLIST (Base Building)']),
+                format=CellFormat(
+                    backgroundColor=Color(1.0, 0.96, 0.8),
+                    textFormat=TextFormat(bold=True, color=Color(0.6, 0.4, 0.0))
+                )
+            )
+        )
+
+        rules.append(buy_rule)
+        rules.append(watchlist_rule)
+        rules.save()
+
+        print(f"Successfully synced {len(df)} rows to Google Sheets tab [{month_tab_name}].")
+
+    except Exception as e:
+        print(f"Failed to sync with Google Sheets: {e}")
+
 if __name__ == "__main__":
     universe = get_nifty_500_tickers()
     results = []
 
     print(f"Executing Quant Screener V2 engine across {len(universe)} tickers...")
 
-    # Multi-threaded execution across Nifty 500 universe
     with ThreadPoolExecutor(max_workers=10) as executor:
         futures = {executor.submit(evaluate_quant_model_v2, ticker): ticker for ticker in universe}
         for future in as_completed(futures):
@@ -324,15 +399,17 @@ if __name__ == "__main__":
         df_res = pd.DataFrame(results)
         os.makedirs("output", exist_ok=True)
         
-        # Save complete auditable CSV file
+        # 1. Save CSV Artifact
         df_res.to_csv("output/quant_screener_results.csv", index=False)
-        print("\nScreening Complete. Comprehensive audit saved to output/quant_screener_results.csv")
+        print("\nScreening Complete. File saved to output/quant_screener_results.csv")
         
-        # Print active candidates summary
+        # 2. Console Summary
         active = df_res[df_res['Action'] != "REJECT"].sort_values(by="Total_Score", ascending=False)
         print("\n--- QUALIFIED SCREENER CANDIDATES ---")
         print(active[["Ticker", "Fundamental_Status", "Data_Quality", "Fund_Score", "Tech_Score", "Total_Score", "Action"]])
         
+        # 3. Dispatches
         send_telegram_alert(df_res)
+        sync_to_google_sheets(df_res)
     else:
-        print("Screening Complete. No stocks met the auditing thresholds.")
+        print("Screening Complete. No valid output generated.")
