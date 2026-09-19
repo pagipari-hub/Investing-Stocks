@@ -6,6 +6,7 @@ import requests
 import pandas as pd
 import numpy as np
 import yfinance as yf
+from historical_memory import update_history
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import gspread
 from gspread_formatting import (
@@ -489,6 +490,10 @@ if __name__ == "__main__":
         df_res = pd.DataFrame(results)
         os.makedirs("output", exist_ok=True)
         
+        # Update persistent historical qualification / inflection memory
+        history_df = update_history(df_res)
+        print(f"Historical memory updated: {len(history_df)} stocks tracked.")
+
         # Save CSV Artifact
         df_res.to_csv("output/quant_screener_results.csv", index=False)
         print("\nScreening Complete. File saved to output/quant_screener_results.csv")
