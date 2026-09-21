@@ -50,27 +50,33 @@ def fetch_benchmark_data(symbol="^NSEI"):
 
 def extract_latest_two_years(series_or_df):
     """Sorts financial reporting periods chronologically to extract current vs previous year values."""
+    values = extract_latest_years(series_or_df, 2)
+    if values is None:
+        return None, None
+    return values[0], values[1]
+
+
+def extract_latest_years(series_or_df, count):
+    """Returns the latest annual values in descending reporting-period order."""
     if series_or_df is None or series_or_df.empty:
-        return None, None
-    
+        return None
+
     cleaned = series_or_df.dropna()
-    if len(cleaned) < 2:
-        return None, None
-    
+    if len(cleaned) < count:
+        return None
+
     try:
         sorted_series = cleaned.sort_index(ascending=False)
-        curr_val = float(sorted_series.iloc[0])
-        prev_val = float(sorted_series.iloc[1])
-        return curr_val, prev_val
+        return [float(v) for v in sorted_series.iloc[:count]]
     except Exception:
-        return None, None
+        return None
 
 def evaluate_quant_model_v3(symbol, benchmark_close_series):
     """
     Evaluates individual ticker against the Unified Quant Engine:
     - 100-Point Audit Engine & Hard Gates
     - Stage 1 Emerging Entity Pipeline (Tolerates temporary ROE/Margin drag for >20% growth)
-    - Relative ROC (12-period) & 21 EMA Technical Engine
+    - Relative ROC (12-period) & 21 EMA Technical Engine (scoring only)
     """
     audit = {
         "Ticker": symbol.replace(".NS", ""),
@@ -117,7 +123,6 @@ def evaluate_quant_model_v3(symbol, benchmark_close_series):
         audit["Above_21_EMA"] = latest_close > latest_ema21
 
         # Relative ROC (12-period) Calculation against Benchmark
-        rel_roc_pass = False
         stock_roc_21 = np.nan
         bench_roc_21 = np.nan
 
@@ -137,9 +142,6 @@ def evaluate_quant_model_v3(symbol, benchmark_close_series):
                 stock_roc_21 = float(s_roc21_series.iloc[-1])
                 bench_roc_21 = float(b_roc21_series.iloc[-1])
                 audit["Stock_ROC_21"] = round(stock_roc_21, 2)
-
-                if audit["Rel_ROC_12"] > 0 and audit["Above_21_EMA"]:
-                    rel_roc_pass = True
 
         # =========================================================
         # FINANCIAL STATEMENTS PARSING
@@ -161,28 +163,40 @@ def evaluate_quant_model_v3(symbol, benchmark_close_series):
         # PILLAR 1: REVENUE GROWTH (25 Pts) + HARD GATE FLOOR
         # ---------------------------------------------------------
         if 'Total Revenue' in financials.index:
-            rev_curr, rev_prev = extract_latest_two_years(financials.loc['Total Revenue'])
-            if rev_curr and rev_prev and rev_prev > 0:
-                rev_growth = (rev_curr - rev_prev) / rev_prev
-                audit["Revenue_Growth_Pct"] = round(rev_growth * 100, 2)
-                metrics_computed += 1
+            revenue_values = extract_latest_years(financials.loc['Total Revenue'], 4)
 
-                # Flag high-growth emerging entity (Stage 1 Candidate)
-                if rev_growth >= 0.20:
-                    is_emerging_growth = True
+            # Revenue growth is a 3-year CAGR, not a single-year YoY change.
+            # Four annual observations are required: latest year and the year three
+            # reporting periods earlier.
+            if revenue_values is not None:
+                rev_curr = revenue_values[0]
+                rev_3y_ago = revenue_values[3]
 
-                # 🛑 HARD GATE 1: Revenue YoY Growth Must Be >= 8.0%
-                if rev_growth < 0.08:
-                    audit["Error_Reason"] = f"Failed Hard Gate: Revenue Growth ({audit['Revenue_Growth_Pct']}%) < 8.0%"
-                    audit["Action"] = "REJECT"
-                    return audit
+                if rev_curr > 0 and rev_3y_ago > 0:
+                    rev_cagr = (rev_curr / rev_3y_ago) ** (1 / 3) - 1
+                    audit["Revenue_Growth_Pct"] = round(rev_cagr * 100, 2)
+                    metrics_computed += 1
 
-                if rev_growth >= 0.20:
-                    fund_score += 25.0
-                elif rev_growth >= 0.15:
-                    fund_score += 18.0
-                elif rev_growth >= 0.08:
-                    fund_score += 10.0
+                    # Flag high-growth emerging entity (Stage 1/Stage 2 Candidate)
+                    if rev_cagr >= 0.20:
+                        is_emerging_growth = True
+
+                    # 🛑 HARD GATE 1: 3-Year Revenue CAGR Must Be >= 8.0%
+                    if rev_cagr < 0.08:
+                        audit["Error_Reason"] = f"Failed Hard Gate: 3Y Revenue CAGR ({audit['Revenue_Growth_Pct']}%) < 8.0%"
+                        audit["Action"] = "REJECT"
+                        return audit
+
+                    if rev_cagr >= 0.20:
+                        fund_score += 25.0
+                    elif rev_cagr >= 0.15:
+                        fund_score += 18.0
+                    elif rev_cagr >= 0.08:
+                        fund_score += 10.0
+            else:
+                audit["Error_Reason"] = "Insufficient annual revenue history for 3-year CAGR"
+                audit["Action"] = "REJECT"
+                return audit
 
         # ---------------------------------------------------------
         # PILLAR 2: EBITDA MARGIN EXPANSION (25 Pts)
@@ -298,8 +312,9 @@ def evaluate_quant_model_v3(symbol, benchmark_close_series):
         if (latest['Close'] > latest['EMA_200']) and (latest['EMA_50'] > latest['EMA_200']):
             tech_score += 5.0
 
-        # Relative ROC & 21 EMA Alignment (5 Pts)
-        if rel_roc_pass:
+        # Relative Strength (5 Pts)
+        # Relative ROC is a strength measurement, not a qualification gate.
+        if not np.isnan(audit["Rel_ROC_12"]) and audit["Rel_ROC_12"] > 0 and audit["Above_21_EMA"]:
             tech_score += 5.0
 
         # Breakout Expansion (5 Pts)
@@ -315,8 +330,9 @@ def evaluate_quant_model_v3(symbol, benchmark_close_series):
         # =========================================================
         has_positive_ebitda = (ebitda_curr is not None and ebitda_curr > 0)
 
-        # 1. STAGE 2 MULTI-BAGGER TRIGGER: High Growth + EBITDA Positive + Relative Momentum Breakout
-        if is_emerging_growth and has_positive_ebitda and rel_roc_pass:
+        # 1. STAGE 2 MULTI-BAGGER TRIGGER: High Growth + EBITDA Positive.
+        # Relative ROC is displayed/scored separately; it is NOT a gate.
+        if is_emerging_growth and has_positive_ebitda:
             audit["Action"] = "STAGE 2 MULTI-BAGGER ALLOCATION"
 
         # 2. STAGE 1 OBSERVE / SETUP: High Revenue Growth (>20%) but temporary EBITDA/ROE Drag (e.g. Zota Phase B)
@@ -324,7 +340,7 @@ def evaluate_quant_model_v3(symbol, benchmark_close_series):
             audit["Action"] = "STAGE 1 OBSERVE / SETUP (Pre-EBITDA Inflection)"
 
         # 3. FULL BUY SIGNAL: Proven High-Quality Quant Compounder (Score >= 75)
-        elif audit["Fundamental_Status"] == "VALID" and fund_score >= 60.0 and audit["Total_Score"] >= 75.0 and rel_roc_pass:
+        elif audit["Fundamental_Status"] == "VALID" and fund_score >= 60.0 and audit["Total_Score"] >= 75.0:
             audit["Action"] = "FULL BUY SIGNAL"
 
         # 4. WATCHLIST (Base Building): Strong Fundamentals, awaiting Technical / Rel ROC Confirmation
@@ -361,7 +377,7 @@ def send_telegram_alert(df):
     msg += f"• Stage 1 Observe Setup: {len(stage1_observe)}\n"
     msg += f"• Proven Full Buy Signals: {len(buys)}\n\n"
 
-    msg += "🔥 *STAGE 2 MULTI-BAGGER TRIGGERS (Rel ROC > 0 + Growth > 20%):*\n"
+    msg += "🔥 *STAGE 2 MULTI-BAGGER TRIGGERS (Growth > 20% + EBITDA Positive):*\n"
     if not multibaggers.empty:
         for _, r in multibaggers.head(10).iterrows():
             msg += f"• *{r['Ticker']}*: ₹{r['Close_Price']} | Rev Growth: +{r['Revenue_Growth_Pct']}% | Rel ROC(12): {r['Rel_ROC_12']} | Score: {r['Total_Score']}\n"
